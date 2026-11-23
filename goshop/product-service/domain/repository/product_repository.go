@@ -3,6 +3,7 @@ package repository
 
 import (
 	"errors"
+	"strconv"
 
 	common "git.mashibing.com/msb_47094/shopping-comm"
 	"goproduct/domain/model"
@@ -112,8 +113,16 @@ func (u *ProductRepository) UpdateSku(req *proto.UpdateSkuReq) (bool, error) {
 		if res.RowsAffected == 0 {
 			return false, errors.New("库存不足或规格不存在")
 		}
+		// 扣减已经在数据库里完成。分片名只说明这一行在多库时该去哪，不参与这次更新。
+		// 事件是旁路：队列满了也不把已经扣掉的库存说成失败。
+		shard := common.StockRing.Get(strconv.FormatInt(int64(sku.SkuId), 10))
+		common.Emit("stock", int64(sku.SkuId), "shard="+shard+" delta="+strconv.FormatInt(int64(sku.Stock), 10))
 		return true, nil
 	}
 	tb := u.mysqlDB.Model(&model.ProductSku{}).Where("id=?", sku.SkuId).Update("stock", sku.Stock)
+	if tb.Error == nil {
+		shard := common.StockRing.Get(strconv.FormatInt(int64(sku.SkuId), 10))
+		common.Emit("stock", int64(sku.SkuId), "shard="+shard+" set="+strconv.FormatInt(int64(sku.Stock), 10))
+	}
 	return tb.Error == nil, tb.Error
 }

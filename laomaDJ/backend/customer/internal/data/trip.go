@@ -18,6 +18,7 @@ func (cd *CustomerData) CreateTrip(customerID uint, origin, destination string, 
 	if err := cd.data.Mdb.Create(row).Error; err != nil {
 		return nil, err
 	}
+	enqueueTrip(row)
 	return row, nil
 }
 

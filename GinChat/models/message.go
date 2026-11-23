@@ -5,6 +5,7 @@ import (
 	"crypto/md5"
 	"encoding/json"
 	"fmt"
+	"ginchat/scale"
 	"ginchat/utils"
 	"log"
 	"net"
@@ -14,7 +15,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/go-redis/redis/v8"
 	"github.com/gorilla/websocket"
 	"github.com/spf13/viper"
 )
@@ -49,7 +49,8 @@ func (table *Message) TableName() string {
 
 // Node 是一个在线用户在本进程里的连接。
 // 读协程负责收浏览器的 JSON，写协程负责把 DataQueue 里的字节写回浏览器，两边不要互相等待。
-// clientMap 用读写锁。心跳时间用原子变量。socket 的写和关共用 writeMu。这三处保护的不是同一份数据，所以没有锁顺序问题。
+// 在线表是分片锁，见 clients。心跳时间用原子变量。socket 的写和关共用 writeMu。
+// 这三处保护的不是同一份数据，所以没有锁顺序问题。
 type Node struct {
 	Conn      *websocket.Conn // 和这个浏览器之间的长连接
 	Addr      string          // 远端地址，会写进 Redis 的 online_ 值
@@ -59,22 +60,21 @@ type Node struct {
 	done      chan struct{}   // 关掉它，写协程就退出。只关一次
 	once      sync.Once       // 保证 offline 只跑一遍。读、写、定时器都可能触发清理
 	writeMu   sync.Mutex      // gorilla 的连接不能同时 Write 和 Close。写协程和 offline 共用这把锁
+	Gateway   string          // 一致性哈希给出的接入机。单机固定是 ginchat-local
 	// heartbeat 是最近一次心跳的 Unix 秒。读协程写，清理协程读，必须用原子操作。
 	heartbeat uint64
+	// onlineRefresh 是上一次把在线标记交给队列的 Unix 秒。
+	// 心跳大约 10 秒一次，但 Redis 不必每次都写。间隔小于 15 秒就跳过，把写压力从「在线人数」降到「在线人数 / 15 秒」。
+	onlineRefresh uint64
 }
 
 var (
-	// clientMap 只在本进程有效。一个用户 ID 对一条当前连接，后连上的会替换先连上的。
-	clientMap = make(map[int64]*Node)
-	// rwLocker 保护 clientMap。查在线用读锁，登记和删除用写锁。
-	rwLocker sync.RWMutex
 	// udpOn 为 1 时，dispatch 才会把消息再广播到局域网。StartUDP 成功后才置上。
 	// 用原子变量：写发生在启动协程，读发生在之后的聊天协程。
 	udpOn uint32
-	// udpSend 是待广播的原始 JSON。缓冲 1024，满了就丢，避免拖住聊天协程。
+	// udpSend 是跨机器的有界队列。缓冲 1024，满了就丢，避免局域网慢把本机聊天协程拖住。
+	// 本进程内的历史记录和在线续期走 chatBus，不走这条通道。
 	udpSend = make(chan []byte, 1024)
-	// seenMsg 记下最近一分钟见过的消息摘要。本机 UDP 会把刚发出去的包收回来，用来挡第二次投递。
-	seenMsg sync.Map
 )
 
 // MsgKey 拼出两个人私聊记录的 Redis 键，形如 msg_较小ID_较大ID。
@@ -141,14 +141,16 @@ func Chat(writer http.ResponseWriter, request *http.Request) {
 		done:      make(chan struct{}),
 	}
 	atomic.StoreUint64(&node.heartbeat, now)
-	// 先放进表，再让旧连接下线。旧连接的 offline 会核对「表里是不是自己」，
-	// 此时表里已经是新连接，所以它只会关自己的 socket，不会把新连接删掉。
-	rwLocker.Lock()
-	if old, ok := clientMap[userId]; ok && old != node {
-		go old.offline()
+	atomic.StoreUint64(&node.onlineRefresh, now)
+	// 单机环上只有 ginchat-local。多机时这里就是这名用户被分配到的那台接入机。
+	node.Gateway = gatewayOf(userId)
+	// 先放进表，再让旧连接下线。Swap 在该用户所在的分片锁里同时完成「读出旧的、写上新的」。
+	// 旧连接的 offline 会核对「表里是不是自己」。此时表里已经是新连接，所以它只会关自己的 socket。
+	if old, ok := clients.Swap(userId, node); ok {
+		if prev, isNode := old.(*Node); isNode && prev != node {
+			go prev.offline()
+		}
 	}
-	clientMap[userId] = node
-	rwLocker.Unlock()
 
 	go sendProc(node)
 	go recvProc(node)
@@ -191,34 +193,40 @@ func recvProc(node *Node) {
 			node.Heartbeat(uint64(time.Now().Unix()))
 			continue
 		}
-		dispatch(data)
+		// ReadMessage 返回的缓冲区在下一次读取时会被覆盖。
+		// 投递和写 Redis 都发生在别的协程里，所以这里必须复制一份。
+		// 这块内存会跨协程活很久，不能放进 sync.Pool，否则下一次取出时内容会串到别的连接上。
+		payload := append([]byte(nil), data...)
+		dispatch(payload)
 	}
 }
 
-// dispatch 按 Type 把原始 JSON 交给私聊或群发，然后再尝试 UDP 广播。
-// 同一段字节如果从 UDP 又绕回来，seenMsg 里已经有它的摘要，直接丢掉，避免本机收到两次。
-// 摘要保留一分钟后删除，免得这张表一直变大。
+// dispatch 按 Type 从策略表里取出投递方式，然后再尝试 UDP 广播。
+// 同一段字节如果从 UDP 又绕回来，recent 里已经有它的摘要，直接丢掉，避免本机收到两次。
+// 摘要按秒分槽过期，不给每条消息单独做定时器。发送过快的用户会在这里被限流丢掉。
 func dispatch(data []byte) {
-	sum := md5.Sum(data)
-	if _, loaded := seenMsg.LoadOrStore(sum, time.Now()); loaded {
-		return
-	}
-	time.AfterFunc(time.Minute, func() { seenMsg.Delete(sum) })
-
 	var msg Message
 	if err := json.Unmarshal(data, &msg); err != nil {
 		log.Println("dispatch json", err)
 		return
 	}
 	msg.CreateTime = uint64(time.Now().Unix())
-	switch msg.Type {
-	case 1:
-		sendMsg(msg.TargetId, data)
-	case 2:
-		sendGroupMsg(msg.TargetId, msg.UserId, data)
-	default:
-		log.Println("忽略未知消息类型", msg.Type)
+	if !sendLimit.Allow(msg.UserId) {
+		log.Println("发送过快，丢掉这一条", msg.UserId)
+		return
 	}
+	// 通过限流之后才记摘要。被丢掉的消息不占去重表，客户端可以再发一次同样的内容。
+	sum := md5.Sum(data)
+	if !recent.First(sum) {
+		return
+	}
+	deliver, ok := deliverByType[msg.Type]
+	if !ok {
+		log.Println("忽略未知消息类型", msg.Type)
+		broadMsg(data)
+		return
+	}
+	deliver(msg, data)
 	broadMsg(data)
 }
 
@@ -249,25 +257,16 @@ func sendMsg(userId int64, msg []byte) {
 		return
 	}
 
-	rwLocker.RLock()
-	node, onlineHere := clientMap[userId]
-	rwLocker.RUnlock()
+	node, onlineHere := nodeOf(userId)
 	if onlineHere && redisOnline(userId) {
 		node.enqueue(msg)
 	}
 	// 群消息只负责投递。私聊才按两个人的 ID 存进 Redis，避免群记录混进单聊历史。
+	// 写入交给 chatBus 的工人，读协程不在这里等 Redis 的往返。
 	if header.Type != 1 {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	err := utils.Red.ZAdd(ctx, MsgKey(header.UserId, userId), &redis.Z{
-		Score:  float64(time.Now().UnixMilli()),
-		Member: string(msg),
-	}).Err()
-	if err != nil {
-		log.Println("保存聊天记录", err)
-	}
+	publishPrivate(header.UserId, msg)
 }
 
 // enqueue 把一条消息放进写队列。
@@ -327,7 +326,20 @@ func (node *Node) writeMessage(data []byte) error {
 // 同时把 Redis 的 online_ 键按配置时长重新写一遍，等于给在线标记续期。
 func (node *Node) Heartbeat(currentTime uint64) {
 	atomic.StoreUint64(&node.heartbeat, currentTime)
-	SetUserOnlineInfo(onlineKey(node.UserId), []byte(node.Addr), onlineTTL())
+	last := atomic.LoadUint64(&node.onlineRefresh)
+	if currentTime < last+15 {
+		return
+	}
+	if !atomic.CompareAndSwapUint64(&node.onlineRefresh, last, currentTime) {
+		return
+	}
+	body := append([]byte(nil), node.Addr...)
+	err := chatBus.Publish(scale.Message{Topic: "online", Key: node.UserId, Body: body})
+	if err != nil {
+		// 队列没接住就退回直接写，并把时间拨回去，下一次心跳还能再试。
+		atomic.StoreUint64(&node.onlineRefresh, last)
+		SetUserOnlineInfo(onlineKey(node.UserId), body, onlineTTL())
+	}
 }
 
 // offline 关掉这条连接，并且只做一次。
@@ -335,11 +347,10 @@ func (node *Node) Heartbeat(currentTime uint64) {
 // 然后关掉 done，写协程会退出；删掉 Redis 在线标记；最后关闭 socket。
 func (node *Node) offline() {
 	node.once.Do(func() {
-		rwLocker.Lock()
-		if cur, ok := clientMap[node.UserId]; ok && cur == node {
-			delete(clientMap, node.UserId)
-		}
-		rwLocker.Unlock()
+		clients.DeleteIf(node.UserId, func(v interface{}) bool {
+			cur, ok := v.(*Node)
+			return ok && cur == node
+		})
 		close(node.done)
 		if utils.Red != nil {
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -363,14 +374,14 @@ func CleanConnection(param interface{}) (result bool) {
 		}
 	}()
 	now := uint64(time.Now().Unix())
-	rwLocker.RLock()
 	expired := make([]*Node, 0)
-	for _, node := range clientMap {
-		if node.IsHeartbeatTimeOut(now) {
+	// Range 逐片加读锁。这里只收集指针，关连接放到锁外面，避免关 socket 时再去抢同一片的写锁。
+	clients.Range(func(_ int64, v interface{}) {
+		node, ok := v.(*Node)
+		if ok && node.IsHeartbeatTimeOut(now) {
 			expired = append(expired, node)
 		}
-	}
-	rwLocker.RUnlock()
+	})
 	for _, node := range expired {
 		log.Println("心跳超时，关闭连接", node.UserId)
 		node.offline()
