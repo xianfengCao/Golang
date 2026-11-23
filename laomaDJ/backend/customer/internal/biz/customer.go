@@ -10,6 +10,8 @@ import (
 	"regexp"
 	"time"
 
+	"laomadj/scale"
+
 	"gorm.io/gorm"
 )
 
@@ -69,6 +71,13 @@ type CustomerToken struct {
 	TokenCreatedAt sql.NullTime `gorm:"comment:最近一次签发时间" json:"token_created_at"`
 }
 
+// 同一条路线在这一进程里合并成一次计价调用。不同路线互不影响。
+// 计价连续失败 5 次后熔断 10 秒，避免地图或计价卡住时把乘客进程的请求全堵在连接上。
+var (
+	priceFlight  scale.Flight
+	priceBreaker = scale.NewBreaker(5, 10*time.Second)
+)
+
 // CustomerBiz 处理需要调用其它服务的乘客业务。目前只有询价。
 type CustomerBiz struct{}
 
@@ -83,18 +92,37 @@ func NewCustomerBiz() *CustomerBiz {
 // 连接按服务名缓存。计价进程重启后，要连同乘客进程一起重启，否则可能拿到已经断开的连接。
 // 出错时价格为 0，err 是拨号失败或计价服务返回的 gRPC 错误。
 func (cb *CustomerBiz) GetEstimatePrice(ctx context.Context, origin, destination string) (int64, error) {
-	conn, err := discover.Default.Conn("Valuation", "127.0.0.1:9300")
-	if err != nil {
-		return 0, err
-	}
-	reply, err := valuation.NewValuationClient(conn).GetEstimatePrice(ctx, &valuation.GetEstimatePriceReq{
-		Origin:      origin,
-		Destination: destination,
+	key := origin + "|" + destination
+	v, err := priceFlight.Do(key, func() (interface{}, error) {
+		var price int64
+		err := priceBreaker.Do(func() error {
+			// 合并后的这一次调用不绑在第一个请求的 context 上。
+			// 否则第一个页面取消，会把正在等待同一条路线的其它请求一起取消。
+			callCtx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+			defer cancel()
+			conn, err := discover.Default.Conn("Valuation", "127.0.0.1:9300")
+			if err != nil {
+				return err
+			}
+			reply, err := valuation.NewValuationClient(conn).GetEstimatePrice(callCtx, &valuation.GetEstimatePriceReq{
+				Origin:      origin,
+				Destination: destination,
+			})
+			if err != nil {
+				return err
+			}
+			price = reply.GetPrice()
+			return nil
+		})
+		if err != nil {
+			return nil, err
+		}
+		return price, nil
 	})
 	if err != nil {
 		return 0, err
 	}
-	return reply.GetPrice(), nil
+	return v.(int64), nil
 }
 
 // TokenTTL 把 CustomerDuration 换成 time.Duration。

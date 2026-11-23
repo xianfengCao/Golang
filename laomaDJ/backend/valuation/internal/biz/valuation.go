@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"time"
 
+	"laomadj/scale"
 	"valuation/api/mapService"
 	"valuation/internal/discover"
 
@@ -42,6 +43,12 @@ type PriceRuleWork struct {
 type PriceRuleInterface interface {
 	GetRule(cityID uint, hour int) (*PriceRule, error)
 }
+
+// 同一路线合并成一次地图调用。地图连续失败 5 次后熔断 10 秒，询价直接失败，不再占用地图连接。
+var (
+	driveFlight  scale.Flight
+	driveBreaker = scale.NewBreaker(5, 10*time.Second)
+)
 
 // ValuationBiz 先问地图要距离和时长，再按规则算价。
 type ValuationBiz struct {
@@ -84,6 +91,33 @@ func (vb *ValuationBiz) GetPrice(ctx context.Context, distance, duration string,
 // Consul 可用时按名字 Map 发现，否则直连 127.0.0.1:9200。
 // 地图没有返回这两个字段时，不当成 0 公里，而是返回错误，避免用空串算出起步价。
 func (vb *ValuationBiz) GetDrivingInfo(ctx context.Context, origin, destination string) (string, string, error) {
+	key := origin + "|" + destination
+	v, err := driveFlight.Do(key, func() (interface{}, error) {
+		var pair [2]string
+		err := driveBreaker.Do(func() error {
+			callCtx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+			defer cancel()
+			distance, duration, err := vb.fetchDriving(callCtx, origin, destination)
+			if err != nil {
+				return err
+			}
+			pair = [2]string{distance, duration}
+			return nil
+		})
+		if err != nil {
+			return nil, err
+		}
+		return pair, nil
+	})
+	if err != nil {
+		return "", "", err
+	}
+	pair := v.([2]string)
+	return pair[0], pair[1], nil
+}
+
+// fetchDriving 真正拨去地图服务。合并和熔断包在 GetDrivingInfo 里，这里只做一次调用。
+func (vb *ValuationBiz) fetchDriving(ctx context.Context, origin, destination string) (string, string, error) {
 	conn, err := discover.Default.Conn("Map", "127.0.0.1:9200")
 	if err != nil {
 		return "", "", err

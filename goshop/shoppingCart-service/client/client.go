@@ -89,6 +89,12 @@ func main() {
 			return
 		}
 		userID := userIDFromHeader(uuid)
+		// 先限流、再看幂等，然后才去打用户、商品、库存这些远程服务。
+		// 过不了这道闸就不要占用下游连接池。
+		if err := guardCart(int64(userID), c.GetHeader("Idempotency-Key")); err != nil {
+			common.RespFail(c.Writer, &proto.AddCartResp{}, err.Error())
+			return
+		}
 		//Token校验
 		//拼接请求信息
 		tokenReq := &proto.TokenReq{
@@ -171,6 +177,8 @@ func main() {
 		resp.ProductSkuSimple = &shown
 		resp.ProductSimple = respDetail.ProductDetail[0]
 		log.Println(" /AddCart  resp :", resp)
+		// 到这里库存和购物车都已经写完。记住幂等键，并把「加购成功」丢进本进程队列，不在这条 HTTP 协程里做通知。
+		rememberCart(userID, c.GetHeader("Idempotency-Key"), req.ProductSkuId, req.Number)
 		////writer  data  message  row  total  field
 		common.RespOK(c.Writer, resp, "请求成功")
 	})
@@ -252,6 +260,12 @@ func main() {
 			return
 		}
 		userID := userIDFromHeader(uuid)
+		// 先限流、再看幂等，然后才去打用户、商品、库存这些远程服务。
+		// 过不了这道闸就不要占用下游连接池。
+		if err := guardCart(int64(userID), c.GetHeader("Idempotency-Key")); err != nil {
+			common.RespFail(c.Writer, &proto.AddCartResp{}, err.Error())
+			return
+		}
 		//Token校验
 		//拼接请求信息
 		tokenReq := &proto.TokenReq{

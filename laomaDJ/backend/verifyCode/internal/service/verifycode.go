@@ -6,10 +6,17 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/binary"
+	"fmt"
 	"time"
+
+	"laomadj/scale"
 
 	pb "verifyCode/api/verifyCode"
 )
+
+// codeLimit 按整个进程限流，不按手机号。调用方可以随便填手机号，按手机号分桶会被海量假号撑爆。
+// 每秒 2000 个、突发 500。真正发短信时还要在短信网关再限一次，这里只保护本进程的随机数和 CPU。
+var codeLimit = scale.NewLimiter(2000, 500, 1, 1)
 
 // VerifyCodeService 生成验证码。它不存码，存到 Redis 是乘客和司机服务的事。
 // 乘客用 Redis 1 号库、键 CVC:；司机用 2 号库、键 DVC:。两边互不影响。
@@ -26,6 +33,9 @@ func NewVerifyCodeService() *VerifyCodeService {
 // Length 小于等于 0 时按 6 位。大于 32 时截成 32，避免一次请求生成过长的随机串。
 // Type 为 1（DIGIT）时是纯数字，乘客和司机目前都请求这一类。0 是 DEFAULT，字符集和数字相同。
 func (s *VerifyCodeService) GetVerifyCode(ctx context.Context, req *pb.GetVerifyCodeRequest) (*pb.GetVerifyCodeReply, error) {
+	if !codeLimit.Allow(0) {
+		return nil, fmt.Errorf("验证码请求过多")
+	}
 	length := int(req.Length)
 	if length <= 0 {
 		length = 6

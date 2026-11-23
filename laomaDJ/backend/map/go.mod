@@ -15,6 +15,7 @@ require (
 	google.golang.org/genproto v0.0.0-20220524023933-508584e28198
 	google.golang.org/grpc v1.46.2
 	google.golang.org/protobuf v1.28.0
+	laomadj/scale v0.0.0
 )
 
 require (
@@ -44,3 +45,5 @@ require (
 	golang.org/x/text v0.3.7 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
+
+replace laomadj/scale => ../scale
