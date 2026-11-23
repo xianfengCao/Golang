@@ -11,6 +11,8 @@ import (
 	"strings"
 	"time"
 
+	"laomadj/scale"
+
 	"github.com/go-kratos/kratos/v2/log"
 	"github.com/go-redis/redis/v9"
 	mysqldriver "github.com/go-sql-driver/mysql"
@@ -34,12 +36,16 @@ func NewData(c *conf.Data, cs *conf.Service, logger log.Logger) (*Data, func(), 
 	if c.GetRedis() == nil || c.Redis.GetAddr() == "" {
 		return nil, nil, fmt.Errorf("redis config is empty")
 	}
+	rp := scale.LocalRedis()
 	rdb := redis.NewClient(&redis.Options{
 		Addr:         c.Redis.Addr,
 		DB:           2,
 		DialTimeout:  time.Second,
 		ReadTimeout:  time.Second,
 		WriteTimeout: time.Second,
+		PoolSize:     rp.PoolSize,
+		MinIdleConns: rp.MinIdle,
+		PoolTimeout:  rp.PoolTimeout,
 	})
 	pingCtx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
@@ -118,8 +124,6 @@ func openMySQL(dsn string) (*gorm.DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	sqlDB.SetMaxOpenConns(10)
-	sqlDB.SetMaxIdleConns(2)
-	sqlDB.SetConnMaxLifetime(30 * time.Second)
+	scale.ApplySQL(sqlDB, scale.LocalSQL())
 	return db, nil
 }

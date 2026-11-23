@@ -5,7 +5,8 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
-	"time"
+
+	"laomadj/scale"
 
 	"github.com/go-kratos/kratos/v2/log"
 	mysqldriver "github.com/go-sql-driver/mysql"
@@ -103,8 +104,6 @@ func openMySQL(dsn string) (*gorm.DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	sqlDB.SetMaxOpenConns(10)
-	sqlDB.SetMaxIdleConns(2)
-	sqlDB.SetConnMaxLifetime(30 * time.Second)
+	scale.ApplySQL(sqlDB, scale.LocalSQL())
 	return db, nil
 }

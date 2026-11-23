@@ -9,6 +9,8 @@ import (
 	"os"
 	"time"
 
+	"ginchat/scale"
+
 	"github.com/go-redis/redis/v8"
 	"github.com/spf13/viper"
 	"gorm.io/driver/mysql"
@@ -86,10 +88,12 @@ func InitMySQL() error {
 	if err != nil {
 		return err
 	}
-	// 本机 MySQL 会掐掉闲太久的连接。寿命限制在 30 秒，下次取连接时新建，避免拿着一条已经死掉的连接。
-	sqlDB.SetMaxOpenConns(20)
-	sqlDB.SetMaxIdleConns(5)
-	sqlDB.SetConnMaxLifetime(30 * time.Second)
+	// 连接池上限按「10 亿并发要分片，单进程只拿一小份」来设，不按在线人数来设。
+	// 本机 MySQL 还会掐掉闲太久的连接，所以寿命只有几十秒，下次取连接时新建。
+	plan := scale.LocalSQL()
+	scale.ApplySQL(sqlDB, plan)
+	log.Printf("MySQL 池 MaxOpen=%d。10 亿并发按 %d 个分片演算，每进程约 %d 条，本机用更小的上限",
+		plan.MaxOpen, plan.DBShards, plan.PerProcessConns())
 	if err = sqlDB.Ping(); err != nil {
 		return fmt.Errorf("ping MySQL: %w", err)
 	}
@@ -123,13 +127,29 @@ func InitRedis() error {
 	if addr == "" {
 		return fmt.Errorf("redis.addr 为空")
 	}
+	rp := scale.LocalRedis()
+	pool := viper.GetInt("redis.poolSize")
+	if pool <= 0 {
+		pool = rp.PoolSize
+	}
+	idle := viper.GetInt("redis.minIdleConn")
+	if idle <= 0 {
+		idle = rp.MinIdle
+	}
+	if idle > pool {
+		idle = pool
+	}
+	// PoolSize 仍尊重配置文件。PoolTimeout 是池里没有空闲连接时最多等多久，到点这次命令失败，请求协程不会堵死。
 	Red = redis.NewClient(&redis.Options{
 		Addr:         addr,
 		Password:     viper.GetString("redis.password"),
 		DB:           viper.GetInt("redis.DB"),
-		PoolSize:     viper.GetInt("redis.poolSize"),
-		MinIdleConns: viper.GetInt("redis.minIdleConn"),
+		PoolSize:     pool,
+		MinIdleConns: idle,
+		PoolTimeout:  rp.PoolTimeout,
+		IdleTimeout:  rp.IdleTimeout,
 	})
+	log.Printf("Redis 池 PoolSize=%d MinIdle=%d。命令复用这些连接，不为每个在线用户单独建一条", pool, idle)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	if err := Red.Ping(ctx).Err(); err != nil {

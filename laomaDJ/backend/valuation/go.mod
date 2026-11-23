@@ -17,6 +17,7 @@ require (
 	google.golang.org/protobuf v1.28.0
 	gorm.io/driver/mysql v1.4.4
 	gorm.io/gorm v1.24.2
+	laomadj/scale v0.0.0
 )
 
 require (
@@ -52,3 +53,5 @@ require (
 	golang.org/x/tools v0.0.0-20190907020128-2ca718005c18 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
+
+replace laomadj/scale => ../scale

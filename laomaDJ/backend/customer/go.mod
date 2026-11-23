@@ -18,7 +18,10 @@ require (
 	google.golang.org/protobuf v1.28.1
 	gorm.io/driver/mysql v1.4.4
 	gorm.io/gorm v1.24.2
+	laomadj/scale v0.0.0
 )
+
+replace laomadj/scale => ../scale
 
 require (
 	github.com/armon/go-metrics v0.3.10 // indirect

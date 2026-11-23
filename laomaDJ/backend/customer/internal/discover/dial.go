@@ -57,18 +57,36 @@ type Pool struct {
 // Default 是进程内共用的连接池。没有按请求新建池，避免每个请求各拨一次号。
 var Default = &Pool{conn: map[string]*grpc.ClientConn{}}
 
-// Conn 返回到 service 的连接。
-// service 是注册名，必须和对方 main.go 里的 Name 一致，例如 VerifyCode、Valuation。
-// direct 是 Consul 不可用时的 host:port，例如 127.0.0.1:9000。
+// Conn 返回到 service 的连接。同一个服务名只保留一条，调用方不要按请求去关它。
+//
+// 拨号放在锁外面。如果拿着整张表的锁去等下游握手，一个慢服务会让本进程里所有「第一次调用」排队。
+// 两个协程同时发现还没有连接时，会各拨一次；后写进表的那条被关掉，避免池子里留下用不到的连接。
 // 拨号使用不会取消的 context。如果用请求的 context，请求结束时连接会被取消，缓存就没有意义。
 // 单次 RPC 的超时是 8 秒，另外还受各自 config.yaml 里的 timeout 限制。
 func (p *Pool) Conn(service, direct string) (*grpc.ClientConn, error) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	if c := p.conn[service]; c != nil {
+		p.mu.Unlock()
 		return c, nil
 	}
+	p.mu.Unlock()
 
+	conn, err := dialService(service, direct)
+	if err != nil {
+		return nil, err
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if c := p.conn[service]; c != nil {
+		_ = conn.Close()
+		return c, nil
+	}
+	p.conn[service] = conn
+	return conn, nil
+}
+
+func dialService(service, direct string) (*grpc.ClientConn, error) {
 	opts := []kgrpc.ClientOption{
 		kgrpc.WithTimeout(8 * time.Second),
 		kgrpc.WithMiddleware(tracing.Client()),
@@ -87,11 +105,5 @@ func (p *Pool) Conn(service, direct string) (*grpc.ClientConn, error) {
 	} else {
 		opts = append(opts, kgrpc.WithEndpoint(direct))
 	}
-
-	conn, err := kgrpc.DialInsecure(context.Background(), opts...)
-	if err != nil {
-		return nil, err
-	}
-	p.conn[service] = conn
-	return conn, nil
+	return kgrpc.DialInsecure(context.Background(), opts...)
 }

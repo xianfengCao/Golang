@@ -14,6 +14,8 @@ import (
 	"os"
 	"time"
 
+	"git.mashibing.com/msb_47094/shopping-comm/scale"
+
 	"github.com/go-redis/redis/v8"
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/spf13/viper"
@@ -126,9 +128,11 @@ func GetMysqlFromConsul(vip *viper.Viper) (*gorm.DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	sqlDB.SetMaxOpenConns(20)
-	sqlDB.SetMaxIdleConns(5)
-	sqlDB.SetConnMaxLifetime(30 * time.Second)
+	// 五个服务都会打开自己的库。每个进程单独限流，避免加起来把本机 MySQL 的 max_connections 打满。
+	// 10 亿并发的算法在 scale.LocalSQL：分片之后每进程大约一百多条，本机实际只用几十条。
+	plan := scale.LocalSQL()
+	scale.ApplySQL(sqlDB, plan)
+	log.Printf("MySQL 池 MaxOpen=%d，分片演算每进程 %d 条", plan.MaxOpen, plan.PerProcessConns())
 	if err = sqlDB.Ping(); err != nil {
 		return nil, err
 	}
@@ -141,12 +145,26 @@ func GetRedisFromConsul(vip *viper.Viper) (*redis.Client, error) {
 	if vip == nil || vip.GetString("addr") == "" {
 		return nil, fmt.Errorf("redis config is empty")
 	}
+	rp := scale.LocalRedis()
+	pool := vip.GetInt("poolSize")
+	if pool <= 0 {
+		pool = rp.PoolSize
+	}
+	idle := vip.GetInt("minIdleConn")
+	if idle <= 0 {
+		idle = rp.MinIdle
+	}
+	if idle > pool {
+		idle = pool
+	}
 	red := redis.NewClient(&redis.Options{
 		Addr:         vip.GetString("addr"),
 		Password:     vip.GetString("password"),
 		DB:           vip.GetInt("DB"),
-		PoolSize:     vip.GetInt("poolSize"),
-		MinIdleConns: vip.GetInt("minIdleConn"),
+		PoolSize:     pool,
+		MinIdleConns: idle,
+		PoolTimeout:  rp.PoolTimeout,
+		IdleTimeout:  rp.IdleTimeout,
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
