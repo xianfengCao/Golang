@@ -3,6 +3,8 @@ package biz
 import (
 	"time"
 
+	"laomadj/scale"
+
 	"gorm.io/gorm"
 )
 
@@ -33,15 +35,15 @@ func (TripOrder) TableComment() string {
 
 func (TripOrder) TableName() string { return "trip_orders" }
 
-// CanTransitTrip 规定行程只能往前走，或在结束前取消。已完成不能再取消。
+// tripState 是行程状态机。相同状态不算成功，避免把「再点一次完成」当成新的一次完成。
+// 只允许待接单到行程中、行程中到完成，以及结束前取消。已完成不能再取消，待接单不能直接完成。
+var tripState = scale.NewMachine(false).
+	Allow(TripWaitDriver, TripOngoing).
+	Allow(TripOngoing, TripFinished).
+	Allow(TripWaitDriver, TripCanceled).
+	Allow(TripOngoing, TripCanceled)
+
+// CanTransitTrip 规定行程只能按 tripState 里的边走。
 func CanTransitTrip(from, to string) bool {
-	switch from + ">" + to {
-	case TripWaitDriver + ">" + TripOngoing,
-		TripOngoing + ">" + TripFinished,
-		TripWaitDriver + ">" + TripCanceled,
-		TripOngoing + ">" + TripCanceled:
-		return true
-	default:
-		return false
-	}
+	return tripState.Can(from, to)
 }

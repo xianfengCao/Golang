@@ -1,5 +1,11 @@
 package model
 
+import (
+	"strconv"
+
+	"git.mashibing.com/msb_47094/shopping-comm/scale"
+)
+
 // 订单状态和课程约定一致，支付回调会把待支付改成已支付。
 const (
 	OrderWaitPay  int32 = 1 // 待支付
@@ -11,25 +17,26 @@ const (
 	OrderReviewed int32 = 7 // 已追评
 )
 
-// CanTransit 判断订单能不能从 from 变成 to。
-// 相同状态视为成功，方便支付回调重试。
-// 待支付只能关闭或支付。已支付之后按发货、收货、完成、追评往前走，不能从已发货跳回待支付。
+// orderState 把允许的状态边收成一张表。sameOK 为 true：支付通知重放时，状态已经是目标值也算成功。
+// 0 和待支付一样，可以关闭或支付。已支付之后只能往发货、收货、完成、追评走，不能从已发货退回待支付。
+var orderState = func() *scale.Machine {
+	m := scale.NewMachine(true)
+	allow := func(from, to int32) {
+		m.Allow(strconv.FormatInt(int64(from), 10), strconv.FormatInt(int64(to), 10))
+	}
+	allow(0, OrderClosed)
+	allow(0, OrderPaid)
+	allow(OrderWaitPay, OrderClosed)
+	allow(OrderWaitPay, OrderPaid)
+	allow(OrderPaid, OrderShipped)
+	allow(OrderPaid, OrderClosed)
+	allow(OrderShipped, OrderReceived)
+	allow(OrderReceived, OrderFinished)
+	allow(OrderFinished, OrderReviewed)
+	return m
+}()
+
+// CanTransit 判断订单能不能从 from 变成 to。规则在 orderState 里，不在调用方的 if 里。
 func CanTransit(from, to int32) bool {
-	if from == to {
-		return true
-	}
-	switch from {
-	case 0, OrderWaitPay:
-		return to == OrderClosed || to == OrderPaid
-	case OrderPaid:
-		return to == OrderShipped || to == OrderClosed
-	case OrderShipped:
-		return to == OrderReceived
-	case OrderReceived:
-		return to == OrderFinished
-	case OrderFinished:
-		return to == OrderReviewed
-	default:
-		return false
-	}
+	return orderState.Can(strconv.FormatInt(int64(from), 10), strconv.FormatInt(int64(to), 10))
 }
